@@ -1,0 +1,125 @@
+# =============================================================================
+# docker-compose.yml — Головний файл оркестрації для проєкту med-queue
+# Версія Docker Compose: 3.9
+#
+# Сервіси:
+#   db       — PostgreSQL (база даних)
+#   backend  — FastAPI через Uvicorn
+#   frontend — Next.js у режимі розробки
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Мережі
+# Усі сервіси підключені до ізольованої внутрішньої мережі `med_network`,
+# що дозволяє їм взаємодіяти між собою за іменами сервісів (DNS).
+# ---------------------------------------------------------------------------
+networks:
+  med_network:
+    driver: bridge
+
+# ---------------------------------------------------------------------------
+# Volumes
+# Named volume `postgres_data` забезпечує збереження даних PostgreSQL між
+# перезапусками контейнера. Дані НЕ видаляються при `docker compose down`.
+# Щоб видалити дані, використовуйте `docker compose down -v`.
+# ---------------------------------------------------------------------------
+volumes:
+  postgres_data:
+
+services:
+
+  # -------------------------------------------------------------------------
+  # Сервіс: db (PostgreSQL 16)
+  # Відповідає за зберігання всіх даних застосунку.
+  # Ініціалізується через змінні оточення з файлу .env
+  # -------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine # Легкий образ на базі Alpine Linux
+    container_name: med_queue_db
+    restart: unless-stopped # Автоматичний рестарт при збоях
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      # Монтуємо named volume для збереження даних БД між перезапусками
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # Пробрасуємо порт на хост-машину для зовнішнього доступу (psql, DBeaver тощо)
+      # У продакшені цей рядок варто видалити з міркувань безпеки
+      - "${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - med_network
+    healthcheck:
+      # Перевірка готовності БД перед стартом залежних сервісів
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # -------------------------------------------------------------------------
+  # Сервіс: backend (FastAPI + Uvicorn)
+  # Збирається з локального Dockerfile у теці ./backend
+  # -------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend # Контекст збирання — тека backend/
+      dockerfile: Dockerfile
+    container_name: med_queue_backend
+    restart: unless-stopped
+    environment:
+      # Рядок підключення до PostgreSQL у форматі SQLAlchemy async
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      # Ключ для підпису JWT-токенів (замініть у .env на складний секрет)
+      SECRET_KEY: ${SECRET_KEY:-changeme_in_production}
+      # Дозволені origins для CORS (Next.js dev-сервер)
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      # Режим середовища: development | production
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    volumes:
+      # Hot-reload у режимі розробки: монтуємо вихідний код як volume.
+      # Зміни у файлах .py одразу підхоплюються Uvicorn (--reload).
+      - ./backend:/app
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      # Бекенд стартує лише після успішного healthcheck бази даних
+      db:
+        condition: service_healthy
+    networks:
+      - med_network
+
+  # -------------------------------------------------------------------------
+  # Сервіс: frontend (Next.js)
+  # Збирається з локального Dockerfile у теці ./frontend
+  # -------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend # Контекст збирання — тека frontend/
+      dockerfile: Dockerfile
+    container_name: med_queue_frontend
+    restart: unless-stopped
+    environment:
+      # URL для звернень до бекенду з браузера (публічний)
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      # URL для звернень до бекенду всередині Docker-мережі (SSR/server-side)
+      INTERNAL_API_URL: http://backend:8000
+      # ID лікаря для демо-дашборду
+      NEXT_PUBLIC_DOCTOR_ID: ${NEXT_PUBLIC_DOCTOR_ID:-1}
+      NEXT_PUBLIC_DOCTOR_NAME: ${NEXT_PUBLIC_DOCTOR_NAME:-Лікар}
+      # Вмикаємо telemetry Next.js off для локальної розробки
+      NEXT_TELEMETRY_DISABLED: 1
+    volumes:
+      # Hot-reload: монтуємо вихідний код. node_modules НЕ монтуємо —
+      # вони встановлені всередині образу і повинні залишатися там.
+      - ./frontend:/app
+      - /app/node_modules # Anonymous volume для node_modules
+      - /app/.next # Anonymous volume для кешу Next.js
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - med_network
